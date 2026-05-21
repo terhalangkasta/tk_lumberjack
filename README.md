@@ -27,3 +27,6 @@ tk_lumberjack/
 - ox_lib
 - ox_target
 - oxmysql
+
+# Support
+- [TK Scripts](https://discord.gg/Xj5YYPsWej)
