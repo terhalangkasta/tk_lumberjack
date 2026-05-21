@@ -1,0 +1,23 @@
+{
+  "title": "Lumberjack",
+  "no_axe": "You don't have an axe!",
+  "no_tool": "You don't have the required tool!",
+  "tree_unavailable": "That tree can't be chopped.",
+  "tree_too_far": "You are too far from that tree.",
+  "tree_created": "Tree #%d created successfully!",
+  "tree_create_failed": "Failed to create tree.",
+  "not_at_station": "You are not at the processing station.",
+  "no_raw_wood": "You don't have any raw wood.",
+  "processed_wood": "You processed raw wood into usable wood.",
+  "processed_plank": "You processed raw wood into planks.",
+  "chop_label": "Chop Tree",
+  "process_open": "Open Processing Menu",
+  "menu_title": "Lumberjack Processing",
+  "menu_wood_title": "Process Wood",
+  "menu_wood_desc": "Turn raw wood into usable material",
+  "menu_plank_title": "Process Plank",
+  "menu_plank_desc": "Turn raw wood into planks",
+  "progress_chop": "Chopping tree...",
+  "progress_process": "Processing...",
+  "blip_name": "Tree #%d"
+}

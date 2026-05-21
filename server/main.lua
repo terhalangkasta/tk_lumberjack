@@ -1,288 +1,290 @@
--- server.lua
+-- server/main.lua
+local sharedConfig = require 'config.shared'
+local serverConfig = require 'config.server'
+
 local RSGCore = exports['rsg-core']:GetCoreObject()
 local oxmysql = exports.oxmysql
-local trees = {} -- cache DB rows: trees[id] = { id = id, x = x, y = y, z = z, respawn_time = n }
 
--- Config reference: Config.LumberjackZone.respawnTimers (ms), Config.LumberjackItems...
--- Helper notify
-local function Notify(src, text, type)
+-- cache: trees[id] = { id, x, y, z, respawn_time }
+local trees         = {}
+-- per-tree mutex so a chop can't be confirmed twice while server is mid-process
+local choppingLocks = {}
+-- per-player throttle for requestTrees
+local lastRequest   = {}
+
+-- ---------------------------------------------------------------------------
+-- helpers
+-- ---------------------------------------------------------------------------
+local function dprint(...)
+    if sharedConfig.debug then print('[tk_lumberjack]', ...) end
+end
+
+local function notify(src, key, kind, ...)
     TriggerClientEvent('ox_lib:notify', src, {
-        title = 'Lumberjack',
-        description = text,
-        type = type or 'info'
+        title       = locale('title'),
+        description = locale(key, ...),
+        type        = kind or 'info',
     })
 end
 
--- Fungsi helper untuk mendapatkan player terdekat
-local function GetPlayersInRadius(coords, radius)
-    local players = {}
-    local allPlayers = GetPlayers()
-    
-    for _, playerId in pairs(allPlayers) do
-        local playerPed = GetPlayerPed(playerId)
-        if playerPed then
-            local playerCoords = GetEntityCoords(playerPed)
-            local distance = #(coords - playerCoords)
-            
-            if distance <= radius then
-                table.insert(players, playerId)
+-- Returns array of player ids whose ped is within `radius` of `coords`.
+local function getPlayersInRadius(coords, radius)
+    local result, n = {}, 0
+    local r2 = radius * radius
+    local players = GetPlayers()
+    for i = 1, #players do
+        local pid = players[i]
+        local ped = GetPlayerPed(pid)
+        if ped ~= 0 then
+            local pc = GetEntityCoords(ped)
+            local dx, dy, dz = coords.x - pc.x, coords.y - pc.y, coords.z - pc.z
+            if (dx * dx + dy * dy + dz * dz) <= r2 then
+                n = n + 1
+                result[n] = pid
             end
         end
     end
-    
-    return players
+    return result
 end
 
-local function loadTreesFromDB()
-    oxmysql:fetch('SELECT * FROM lumberjack_trees', {}, function(rows)
-        if not rows then rows = {} end
-        trees = {}
-        for _, r in ipairs(rows) do
-            trees[r.id] = {
-                id = r.id,
-                x = tonumber(r.x),
-                y = tonumber(r.y),
-                z = tonumber(r.z),
-                respawn_time = tonumber(r.respawn_time) or 0
-            }
-        end
+local function broadcastNearby(coords, radius, event, ...)
+    local nearby = getPlayersInRadius(coords, radius)
+    for i = 1, #nearby do
+        TriggerClientEvent(event, nearby[i], ...)
+    end
+end
 
-        -- Untuk initial load, tetap ke semua player
-        local spawnList = {}
-        for id, t in pairs(trees) do
-            if t.respawn_time == 0 or t.respawn_time < os.time() then
-                table.insert(spawnList, { id = t.id, x = t.x, y = t.y, z = t.z })
-            else
-                local delay = math.max(0, (t.respawn_time - os.time()) * 1000)
-                SetTimeout(delay, function()
-                    oxmysql:update('UPDATE lumberjack_trees SET respawn_time = ? WHERE id = ?', { 0, t.id })
-                    
-                    -- INI yang diubah: kirim ke player terdekat saja
-                    local nearbyPlayers = GetPlayersInRadius(vector3(t.x, t.y, t.z), 500.0) -- 500 meter radius
-                    for _, playerId in pairs(nearbyPlayers) do
-                        TriggerClientEvent('tk_lumberjack:client:spawnTree', playerId, t.id, { x = t.x, y = t.y, z = t.z })
-                    end
-                end)
-            end
+local function buildSpawnList(now)
+    now = now or os.time()
+    local list, n = {}, 0
+    for _, t in pairs(trees) do
+        if t.respawn_time == 0 or t.respawn_time < now then
+            n = n + 1
+            list[n] = { id = t.id, x = t.x, y = t.y, z = t.z }
         end
+    end
+    return list
+end
 
-        if #spawnList > 0 then
-            TriggerClientEvent('tk_lumberjack:client:syncTrees', -1, spawnList) -- Initial sync ke semua
-        end
+local function scheduleRespawn(treeId, delayMs)
+    SetTimeout(delayMs, function()
+        local t = trees[treeId]
+        if not t then return end
+        t.respawn_time = 0
+        oxmysql:update('UPDATE lumberjack_trees SET respawn_time = ? WHERE id = ?', { 0, treeId })
+        broadcastNearby(vector3(t.x, t.y, t.z), sharedConfig.radius.stream,
+            'tk_lumberjack:client:spawnTree', treeId, { x = t.x, y = t.y, z = t.z })
     end)
 end
 
--- On resource start, ensure table exists then load trees
+-- ---------------------------------------------------------------------------
+-- DB load
+-- ---------------------------------------------------------------------------
+local function loadTreesFromDB()
+    oxmysql:fetch('SELECT id, x, y, z, respawn_time FROM lumberjack_trees', {}, function(rows)
+        rows  = rows or {}
+        trees = {}
+        local now = os.time()
+
+        for i = 1, #rows do
+            local r  = rows[i]
+            local rt = tonumber(r.respawn_time) or 0
+            trees[r.id] = {
+                id           = r.id,
+                x            = tonumber(r.x),
+                y            = tonumber(r.y),
+                z            = tonumber(r.z),
+                respawn_time = rt,
+            }
+            if rt ~= 0 and rt > now then
+                scheduleRespawn(r.id, (rt - now) * 1000)
+            end
+        end
+
+        dprint(('loaded %d trees from DB'):format(#rows))
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- resource start: ensure schema, then load
+-- ---------------------------------------------------------------------------
 AddEventHandler('onResourceStart', function(resource)
     if resource ~= GetCurrentResourceName() then return end
 
-    exports.oxmysql:query([[
+    oxmysql:query([[
         CREATE TABLE IF NOT EXISTS `lumberjack_trees` (
             `id` INT NOT NULL AUTO_INCREMENT,
-            `x` FLOAT NOT NULL,
-            `y` FLOAT NOT NULL,
-            `z` FLOAT NOT NULL,
+            `x`  FLOAT NOT NULL,
+            `y`  FLOAT NOT NULL,
+            `z`  FLOAT NOT NULL,
             `respawn_time` BIGINT NOT NULL DEFAULT 0,
             PRIMARY KEY (`id`),
             INDEX `idx_respawn_time` (`respawn_time`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    ]], {}, function(result)
-        if result and result.warningStatus == 0 then
-            print('[tk_lumberjack] Table `lumberjack_trees` created successfully!')
-        else
-            print('[tk_lumberjack] Table `lumberjack_trees` already exists.')
-        end
-
-        -- load setelah table sudah dijamin ada
+    ]], {}, function()
         loadTreesFromDB()
     end)
 end)
 
--- Allow clients to request current trees (call this from client on resource start / player loaded)
+AddEventHandler('playerDropped', function()
+    lastRequest[source] = nil
+end)
+
+-- ---------------------------------------------------------------------------
+-- requestTrees (throttled)
+-- ---------------------------------------------------------------------------
 RegisterNetEvent('tk_lumberjack:server:requestTrees', function()
     local src = source
-    local spawnList = {}
-    for id, t in pairs(trees) do
-        if t.respawn_time == 0 or t.respawn_time < os.time() then
-            table.insert(spawnList, { id = t.id, x = t.x, y = t.y, z = t.z })
-        end
+    local now = GetGameTimer()
+    if lastRequest[src] and (now - lastRequest[src]) < serverConfig.requestCooldownMs then
+        return
     end
-    TriggerClientEvent('tk_lumberjack:client:syncTrees', src, spawnList)
+    lastRequest[src] = now
+    TriggerClientEvent('tk_lumberjack:client:syncTrees', src, buildSpawnList())
 end)
 
--- Admin create tree command
+-- ---------------------------------------------------------------------------
+-- admin: createTree
+-- ---------------------------------------------------------------------------
 lib.addCommand('createTree', {
-    help = 'Create a new tree at your position',
-    params = {}, -- ga ada argumen tambahan
-    restricted = { 'admin', 'god' } -- role yang bisa pakai
-}, function(source, args, raw)
+    help       = 'Create a new tree at your position',
+    params     = {},
+    restricted = serverConfig.adminGroups,
+}, function(source)
     local src = source
-    local xPlayer = RSGCore.Functions.GetPlayer(src)
-    if not xPlayer then return end
+    if not RSGCore.Functions.GetPlayer(src) then return end
 
     local ped = GetPlayerPed(src)
-    if not ped then return end
+    if ped == 0 then return end
     local coords = GetEntityCoords(ped)
 
-    oxmysql:insert('INSERT INTO lumberjack_trees (x, y, z) VALUES (?, ?, ?)', 
-    { coords.x, coords.y, coords.z }, function(insertId)
-        if not insertId then
-            return Notify(src, "Failed to create tree.", "error")
-        end
+    oxmysql:insert('INSERT INTO lumberjack_trees (x, y, z) VALUES (?, ?, ?)',
+        { coords.x, coords.y, coords.z }, function(insertId)
+            if not insertId then
+                return notify(src, 'tree_create_failed', 'error')
+            end
 
-        -- update cache
-        trees[insertId] = {
-            id = insertId,
-            x = coords.x,
-            y = coords.y,
-            z = coords.z,
-            respawn_time = 0
-        }
+            trees[insertId] = {
+                id = insertId, x = coords.x, y = coords.y, z = coords.z, respawn_time = 0,
+            }
 
-        -- notify all clients to spawn the tree
-        TriggerClientEvent('tk_lumberjack:client:spawnTree', -1, insertId, {
-            x = coords.x,
-            y = coords.y,
-            z = coords.z
-        })
+            broadcastNearby(coords, sharedConfig.radius.stream,
+                'tk_lumberjack:client:spawnTree', insertId,
+                { x = coords.x, y = coords.y, z = coords.z })
 
-        Notify(src, ("Tree #%d created successfully!"):format(insertId), "success")
-    end)
+            notify(src, 'tree_created', 'success', insertId)
+        end)
 end)
 
--- Callback check axe (server authoritative)
-lib.callback.register('tk_lumberjack:server:checkAxe', function(source)
-    if type(source) ~= 'number' or source <= 0 then return false end
-    local Player = RSGCore.Functions.GetPlayer(source)
+-- ---------------------------------------------------------------------------
+-- callbacks
+-- ---------------------------------------------------------------------------
+lib.callback.register('tk_lumberjack:server:checkAxe', function(src)
+    if type(src) ~= 'number' or src <= 0 then return false end
+    local Player = RSGCore.Functions.GetPlayer(src)
     if not Player then return false end
-    local axe = Player.Functions.GetItemByName(Config.LumberjackItems.RequiredTool)
-    return axe ~= nil
+    return Player.Functions.GetItemByName(sharedConfig.items.requiredTool) ~= nil
 end)
 
--- Client confirmed chop (after client animation finished)
+-- ---------------------------------------------------------------------------
+-- chop confirm
+-- ---------------------------------------------------------------------------
 RegisterNetEvent('tk_lumberjack:server:confirmChop', function(treeId)
-    local src = source
+    local src    = source
     local Player = RSGCore.Functions.GetPlayer(src)
     if not Player then return end
 
     local t = trees[treeId]
-    if not t then
-        return Notify(src, "That tree can't be chopped.", "error")
+    if not t or (t.respawn_time ~= 0 and t.respawn_time > os.time()) then
+        return notify(src, 'tree_unavailable', 'error')
     end
 
-    -- final axe check
-    local axe = Player.Functions.GetItemByName(Config.LumberjackItems.RequiredTool)
-    if not axe then
-        return Notify(src, "You don't have the required tool!", "error")
+    if choppingLocks[treeId] then return end
+    choppingLocks[treeId] = true
+
+    if not Player.Functions.GetItemByName(sharedConfig.items.requiredTool) then
+        choppingLocks[treeId] = nil
+        return notify(src, 'no_tool', 'error')
     end
 
-    local treeCoords = vec3(tonumber(t.x), tonumber(t.y), tonumber(t.z))
-
-    -- 🌲 broadcast topple hanya ke yang dekat
-    local nearbyPlayers = GetPlayersInRadius(treeCoords, 100.0) -- radius bisa diatur
-    for _, id in ipairs(nearbyPlayers) do
-        TriggerClientEvent('tk_lumberjack:client:toppleTree', id, treeId)
+    -- distance sanity check
+    local ped = GetPlayerPed(src)
+    if ped ~= 0 then
+        local pc = GetEntityCoords(ped)
+        local dx, dy, dz = t.x - pc.x, t.y - pc.y, t.z - pc.z
+        local maxDist = sharedConfig.radius.chopAntiCheat
+        if (dx * dx + dy * dy + dz * dz) > (maxDist * maxDist) then
+            choppingLocks[treeId] = nil
+            return notify(src, 'tree_too_far', 'error')
+        end
     end
 
-    -- ⏳ kasih waktu animasi roboh + delay hancur (sama kayak client)
+    local treeCoords = vec3(t.x, t.y, t.z)
+    broadcastNearby(treeCoords, sharedConfig.radius.chop, 'tk_lumberjack:client:toppleTree', treeId)
+
     SetTimeout(2500, function()
-        -- reward items ke player yang nebang (baru sekarang)
-        local log = Config.LumberjackItems.LogItem
-        local twig = Config.LumberjackItems.TwigItem
-        if RSGCore.Shared.Items[log] then
-            Player.Functions.AddItem(log, math.random(1, 4))
-            TriggerClientEvent("rsg-inventory:client:ItemBox", src, RSGCore.Shared.Items[log], "add")
+        local logItem  = sharedConfig.items.logItem
+        local twigItem = sharedConfig.items.twigItem
+        local logR     = sharedConfig.rewards.log
+        local twigR    = sharedConfig.rewards.twig
+
+        if RSGCore.Shared.Items[logItem] then
+            Player.Functions.AddItem(logItem, math.random(logR.min, logR.max))
+            TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[logItem], 'add')
         end
-        if RSGCore.Shared.Items[twig] then
-            Player.Functions.AddItem(twig, math.random(1, 2))
-            TriggerClientEvent("rsg-inventory:client:ItemBox", src, RSGCore.Shared.Items[twig], "add")
+        if RSGCore.Shared.Items[twigItem] then
+            Player.Functions.AddItem(twigItem, math.random(twigR.min, twigR.max))
+            TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[twigItem], 'add')
         end
 
-        -- update DB respawn
-        local respawnMs = Config.LumberjackZone.respawnTimers or 300000
+        local respawnMs = sharedConfig.timers.respawnMs
         local respawnAt = os.time() + math.floor(respawnMs / 1000)
 
-        oxmysql:update('UPDATE lumberjack_trees SET respawn_time = ? WHERE id = ?', { respawnAt, treeId }, function()
-            if trees[treeId] then
-                trees[treeId].respawn_time = respawnAt
-            end
+        if trees[treeId] then trees[treeId].respawn_time = respawnAt end
 
-            -- schedule respawn
-            SetTimeout(respawnMs, function()
-                oxmysql:update('UPDATE lumberjack_trees SET respawn_time = ? WHERE id = ?', { 0, treeId })
-                oxmysql:fetch('SELECT * FROM lumberjack_trees WHERE id = ?', { treeId }, function(result)
-                    if result and result[1] then
-                        local r = result[1]
-                        trees[treeId] = { id = r.id, x = tonumber(r.x), y = tonumber(r.y), z = tonumber(r.z), respawn_time = 0 }
-
-                        -- spawn lagi buat player dekat
-                        local respawnNearby = GetPlayersInRadius(treeCoords, 100.0)
-                        for _, id in ipairs(respawnNearby) do
-                            TriggerClientEvent('tk_lumberjack:client:spawnTree', id, r.id, { x = tonumber(r.x), y = tonumber(r.y), z = tonumber(r.z) })
-                        end
-                    end
-                end)
+        oxmysql:update('UPDATE lumberjack_trees SET respawn_time = ? WHERE id = ?',
+            { respawnAt, treeId }, function()
+                scheduleRespawn(treeId, respawnMs)
+                choppingLocks[treeId] = nil
             end)
-        end)
     end)
 end)
 
--- Proses Kayu Mentah → Kayu Jadi
-RegisterNetEvent("tk_lumberjack:server:processWood", function(coords)
-    local src = source
+-- ---------------------------------------------------------------------------
+-- processing (shared handler)
+-- ---------------------------------------------------------------------------
+local function processItem(src, fromItem, toItem, successKey)
     local Player = RSGCore.Functions.GetPlayer(src)
     if not Player then return end
 
-    if not coords or not IsPlayerNearLocation(coords, Config.LumberjackZone.processLog, 15.0) then
-        Notify(src, "You are not at the wood processing station.", "error")
-        return
+    local ped = GetPlayerPed(src)
+    if ped == 0 then return end
+    local pc        = GetEntityCoords(ped)
+    local sp        = sharedConfig.locations.processLog
+    local maxDist   = sharedConfig.radius.process
+    local dx, dy, dz= sp.x - pc.x, sp.y - pc.y, sp.z - pc.z
+    if (dx * dx + dy * dy + dz * dz) > (maxDist * maxDist) then
+        return notify(src, 'not_at_station', 'error')
     end
 
-    local log = Config.LumberjckItems.LogItem
-    local result = Config.LumberjckItems.ProcessedItem
+    if not RSGCore.Shared.Items[fromItem] or not RSGCore.Shared.Items[toItem] then return end
 
-    if not RSGCore.Shared.Items[log] or not RSGCore.Shared.Items[result] then return end
-
-    local item = Player.Functions.GetItemByName(log)
+    local item = Player.Functions.GetItemByName(fromItem)
     if not item or item.amount < 1 then
-        Notify(src, "You don't have any raw wood.", "error")
-        return
+        return notify(src, 'no_raw_wood', 'error')
     end
 
-    Player.Functions.RemoveItem(log, 1)
-    Player.Functions.AddItem(result, 1)
+    Player.Functions.RemoveItem(fromItem, 1)
+    Player.Functions.AddItem(toItem, 1)
+    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[fromItem], 'remove')
+    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[toItem], 'add')
+    notify(src, successKey, 'success')
+end
 
-    TriggerClientEvent("rsg-inventory:client:ItemBox", src, RSGCore.Shared.Items[log], "remove")
-    TriggerClientEvent("rsg-inventory:client:ItemBox", src, RSGCore.Shared.Items[result], "add")
-    Notify(src, "You processed raw wood into usable wood.", "success")
+RegisterNetEvent('tk_lumberjack:server:processWood', function()
+    processItem(source, sharedConfig.items.logItem, sharedConfig.items.processedItem, 'processed_wood')
 end)
 
--- Proses Kayu Mentah → Papan
-RegisterNetEvent("tk_lumberjack:server:processPlank", function(coords)
-    local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then return end
-
-    if not coords or not IsPlayerNearLocation(coords, Config.LumberjackZone.processLog, 15.0) then
-        Notify(src, "You are not at the plank processing station.", "error")
-        return
-    end
-
-    local log = Config.LumberjckItems.LogItem
-    local result = Config.LumberjckItems.PlankItem
-
-    if not RSGCore.Shared.Items[log] or not RSGCore.Shared.Items[result] then return end
-
-    local item = Player.Functions.GetItemByName(log)
-    if not item or item.amount < 1 then
-        Notify(src, "You don't have any raw wood.", "error")
-        return
-    end
-
-    Player.Functions.RemoveItem(log, 1)
-    Player.Functions.AddItem(result, 1)
-
-    TriggerClientEvent("rsg-inventory:client:ItemBox", src, RSGCore.Shared.Items[log], "remove")
-    TriggerClientEvent("rsg-inventory:client:ItemBox", src, RSGCore.Shared.Items[result], "add")
-    Notify(src, "You processed raw wood into planks.", "success")
+RegisterNetEvent('tk_lumberjack:server:processPlank', function()
+    processItem(source, sharedConfig.items.logItem, sharedConfig.items.plankItem, 'processed_plank')
 end)
