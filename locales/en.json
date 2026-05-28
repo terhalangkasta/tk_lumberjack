@@ -19,5 +19,8 @@
   "menu_plank_desc": "Turn raw wood into planks",
   "progress_chop": "Chopping tree...",
   "progress_process": "Processing...",
-  "blip_name": "Tree #%d"
+  "blip_name": "Tree #%d",
+  "rayfire_blip_name": "Wild Tree",
+  "rayfire_unavailable": "That tree has already fallen.",
+  "rayfire_too_far": "You are too far from that tree."
 }

@@ -7,6 +7,10 @@ RedM lumberjack resource for `rsg-core` with `ox_lib`, `ox_target`, and `oxmysql
 - Chop trees with axe item, animated topple, randomized rewards
 - Wood / plank processing station via `ox_target`
 - Admin command `/createTree` to add a tree at your location
+- RayFire (static map-object) trees: target the world tree, animation played
+  via `SetStateOfRayfireMapObject`. Configure entries in
+  `config/shared.lua > rayfire.trees`. State is persisted in
+  `lumberjack_rayfire`.
 
 ## Structure
 ```

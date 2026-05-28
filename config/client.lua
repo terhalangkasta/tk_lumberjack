@@ -2,6 +2,7 @@ return {
     requestIntervalMs = 5000,
     blipIntervalMs    = 1000,
     blipIdleMs        = 2000,
+    rayfireScanMs     = 1000,
     chopAnim = {
         dict = 'amb_work@world_human_tree_chop@male_a@idle_b',
         clip = 'idle_f',

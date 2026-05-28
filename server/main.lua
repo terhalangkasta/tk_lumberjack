@@ -1,24 +1,37 @@
--- server/main.lua
 local sharedConfig = require 'config.shared'
 local serverConfig = require 'config.server'
 
 local RSGCore = exports['rsg-core']:GetCoreObject()
 local oxmysql = exports.oxmysql
 
--- cache: trees[id] = { id, x, y, z, respawn_time }
+-- Dynamic (DB-backed) trees ---------------------------------------------------
+---@class DBTree
+---@field id integer
+---@field x number
+---@field y number
+---@field z number
+---@field respawn_time integer
 local trees         = {}
--- per-tree mutex so a chop can't be confirmed twice while server is mid-process
 local choppingLocks = {}
--- per-player throttle for requestTrees
 local lastRequest   = {}
 
--- ---------------------------------------------------------------------------
--- helpers
--- ---------------------------------------------------------------------------
+-- RayFire (static map-object) trees -------------------------------------------
+---@class RayfireState
+---@field idx integer
+---@field cfg table
+---@field available boolean
+---@field respawnAt integer epoch seconds; 0 if available
+---@field lock boolean
+local rayfireState = {}
+
+---@param ... any
 local function dprint(...)
     if sharedConfig.debug then print('[tk_lumberjack]', ...) end
 end
 
+---@param src integer
+---@param key string
+---@param kind string|nil
 local function notify(src, key, kind, ...)
     TriggerClientEvent('ox_lib:notify', src, {
         title       = locale('title'),
@@ -27,7 +40,9 @@ local function notify(src, key, kind, ...)
     })
 end
 
--- Returns array of player ids whose ped is within `radius` of `coords`.
+---@param coords vector3
+---@param radius number
+---@return integer[]
 local function getPlayersInRadius(coords, radius)
     local result, n = {}, 0
     local r2 = radius * radius
@@ -47,6 +62,9 @@ local function getPlayersInRadius(coords, radius)
     return result
 end
 
+---@param coords vector3
+---@param radius number
+---@param event string
 local function broadcastNearby(coords, radius, event, ...)
     local nearby = getPlayersInRadius(coords, radius)
     for i = 1, #nearby do
@@ -54,6 +72,11 @@ local function broadcastNearby(coords, radius, event, ...)
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- Dynamic tree handling
+-- ---------------------------------------------------------------------------
+---@param now integer|nil
+---@return table[]
 local function buildSpawnList(now)
     now = now or os.time()
     local list, n = {}, 0
@@ -66,6 +89,8 @@ local function buildSpawnList(now)
     return list
 end
 
+---@param treeId integer
+---@param delayMs integer
 local function scheduleRespawn(treeId, delayMs)
     SetTimeout(delayMs, function()
         local t = trees[treeId]
@@ -77,9 +102,6 @@ local function scheduleRespawn(treeId, delayMs)
     end)
 end
 
--- ---------------------------------------------------------------------------
--- DB load
--- ---------------------------------------------------------------------------
 local function loadTreesFromDB()
     oxmysql:fetch('SELECT id, x, y, z, respawn_time FROM lumberjack_trees', {}, function(rows)
         rows  = rows or {}
@@ -106,7 +128,78 @@ local function loadTreesFromDB()
 end
 
 -- ---------------------------------------------------------------------------
--- resource start: ensure schema, then load
+-- RayFire state handling
+-- ---------------------------------------------------------------------------
+---@param entry table
+---@return string
+local function buildRayfireKey(entry)
+    if entry.key and entry.key ~= '' then return entry.key end
+    local c = entry.coords
+    return ('%s@%.1f,%.1f,%.1f'):format(entry.name, c.x, c.y, c.z)
+end
+
+local function loadRayfireFromDB()
+    local entries = sharedConfig.rayfire and sharedConfig.rayfire.trees or {}
+    rayfireState = {}
+
+    for i = 1, #entries do
+        rayfireState[i] = {
+            idx       = i,
+            cfg       = entries[i],
+            available = true,
+            respawnAt = 0,
+            lock      = false,
+        }
+    end
+
+    if next(rayfireState) == nil then return end
+
+    oxmysql:query('SELECT rkey, respawn_time FROM lumberjack_rayfire', {}, function(rows)
+        rows = rows or {}
+        local now = os.time()
+
+        ---@type table<string, integer>
+        local byKey = {}
+        for i = 1, #rows do byKey[rows[i].rkey] = tonumber(rows[i].respawn_time) or 0 end
+
+        for idx, st in pairs(rayfireState) do
+            local key = buildRayfireKey(st.cfg)
+            local rt  = byKey[key] or 0
+            st.respawnAt = rt
+            if rt ~= 0 and rt > now then
+                st.available = false
+                SetTimeout((rt - now) * 1000, function()
+                    local s = rayfireState[idx]
+                    if not s then return end
+                    s.available = true
+                    s.respawnAt = 0
+                    oxmysql:update('UPDATE lumberjack_rayfire SET respawn_time = ? WHERE rkey = ?',
+                        { 0, key })
+                    local rc = s.cfg.zoneCoords or s.cfg.coords
+                    broadcastNearby(rc, sharedConfig.radius.stream,
+                        'tk_lumberjack:client:rayfireRespawn', idx)
+                end)
+            else
+                st.available = true
+                st.respawnAt = 0
+            end
+        end
+
+        dprint(('loaded %d rayfire entries'):format(#entries))
+    end)
+end
+
+---@return table<integer, boolean>
+local function buildRayfireStatesPayload()
+    local payload = {}
+    for idx, st in pairs(rayfireState) do
+        payload[idx] = st.available
+    end
+    return payload
+end
+
+-- ---------------------------------------------------------------------------
+-- Resource start: ensure schema, then load
 -- ---------------------------------------------------------------------------
 AddEventHandler('onResourceStart', function(resource)
     if resource ~= GetCurrentResourceName() then return end
@@ -123,6 +216,16 @@ AddEventHandler('onResourceStart', function(resource)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     ]], {}, function()
         loadTreesFromDB()
+    end)
+
+    oxmysql:query([[
+        CREATE TABLE IF NOT EXISTS `lumberjack_rayfire` (
+            `rkey` VARCHAR(96) NOT NULL,
+            `respawn_time` BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (`rkey`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ]], {}, function()
+        loadRayfireFromDB()
     end)
 end)
 
@@ -143,8 +246,12 @@ RegisterNetEvent('tk_lumberjack:server:requestTrees', function()
     TriggerClientEvent('tk_lumberjack:client:syncTrees', src, buildSpawnList())
 end)
 
+lib.callback.register('tk_lumberjack:server:getRayfireStates', function()
+    return buildRayfireStatesPayload()
+end)
+
 -- ---------------------------------------------------------------------------
--- admin: createTree
+-- Admin: createTree
 -- ---------------------------------------------------------------------------
 lib.addCommand('createTree', {
     help       = 'Create a new tree at your position',
@@ -177,7 +284,7 @@ lib.addCommand('createTree', {
 end)
 
 -- ---------------------------------------------------------------------------
--- callbacks
+-- Callbacks
 -- ---------------------------------------------------------------------------
 lib.callback.register('tk_lumberjack:server:checkAxe', function(src)
     if type(src) ~= 'number' or src <= 0 then return false end
@@ -187,7 +294,28 @@ lib.callback.register('tk_lumberjack:server:checkAxe', function(src)
 end)
 
 -- ---------------------------------------------------------------------------
--- chop confirm
+-- Reward helper
+-- ---------------------------------------------------------------------------
+---@param Player table RSGCore player
+---@param src integer
+local function grantChopRewards(Player, src)
+    local logItem  = sharedConfig.items.logItem
+    local twigItem = sharedConfig.items.twigItem
+    local logR     = sharedConfig.rewards.log
+    local twigR    = sharedConfig.rewards.twig
+
+    if RSGCore.Shared.Items[logItem] then
+        Player.Functions.AddItem(logItem, math.random(logR.min, logR.max))
+        TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[logItem], 'add')
+    end
+    if RSGCore.Shared.Items[twigItem] then
+        Player.Functions.AddItem(twigItem, math.random(twigR.min, twigR.max))
+        TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[twigItem], 'add')
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Dynamic-tree chop confirm
 -- ---------------------------------------------------------------------------
 RegisterNetEvent('tk_lumberjack:server:confirmChop', function(treeId)
     local src    = source
@@ -207,7 +335,6 @@ RegisterNetEvent('tk_lumberjack:server:confirmChop', function(treeId)
         return notify(src, 'no_tool', 'error')
     end
 
-    -- distance sanity check
     local ped = GetPlayerPed(src)
     if ped ~= 0 then
         local pc = GetEntityCoords(ped)
@@ -223,19 +350,7 @@ RegisterNetEvent('tk_lumberjack:server:confirmChop', function(treeId)
     broadcastNearby(treeCoords, sharedConfig.radius.chop, 'tk_lumberjack:client:toppleTree', treeId)
 
     SetTimeout(2500, function()
-        local logItem  = sharedConfig.items.logItem
-        local twigItem = sharedConfig.items.twigItem
-        local logR     = sharedConfig.rewards.log
-        local twigR    = sharedConfig.rewards.twig
-
-        if RSGCore.Shared.Items[logItem] then
-            Player.Functions.AddItem(logItem, math.random(logR.min, logR.max))
-            TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[logItem], 'add')
-        end
-        if RSGCore.Shared.Items[twigItem] then
-            Player.Functions.AddItem(twigItem, math.random(twigR.min, twigR.max))
-            TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[twigItem], 'add')
-        end
+        grantChopRewards(Player, src)
 
         local respawnMs = sharedConfig.timers.respawnMs
         local respawnAt = os.time() + math.floor(respawnMs / 1000)
@@ -251,8 +366,77 @@ RegisterNetEvent('tk_lumberjack:server:confirmChop', function(treeId)
 end)
 
 -- ---------------------------------------------------------------------------
--- processing (shared handler)
+-- RayFire chop confirm
 -- ---------------------------------------------------------------------------
+RegisterNetEvent('tk_lumberjack:server:confirmRayfireChop', function(idx)
+    local src    = source
+    local Player = RSGCore.Functions.GetPlayer(src)
+    if not Player then return end
+
+    local st = rayfireState[idx]
+    if not st or not st.available or st.lock then
+        return notify(src, 'rayfire_unavailable', 'error')
+    end
+
+    st.lock = true
+
+    if not Player.Functions.GetItemByName(sharedConfig.items.requiredTool) then
+        st.lock = false
+        return notify(src, 'no_tool', 'error')
+    end
+
+    local zoneC = st.cfg.zoneCoords or st.cfg.coords
+
+    local ped = GetPlayerPed(src)
+    if ped ~= 0 then
+        local pc = GetEntityCoords(ped)
+        local dx, dy, dz = zoneC.x - pc.x, zoneC.y - pc.y, zoneC.z - pc.z
+        local maxDist = sharedConfig.radius.chopAntiCheat
+        if (dx * dx + dy * dy + dz * dz) > (maxDist * maxDist) then
+            st.lock = false
+            return notify(src, 'rayfire_too_far', 'error')
+        end
+    end
+
+    st.available = false
+    broadcastNearby(zoneC, sharedConfig.radius.chop, 'tk_lumberjack:client:rayfireFall', idx)
+
+    SetTimeout(2500, function()
+        grantChopRewards(Player, src)
+
+        local respawnMs = st.cfg.respawn or sharedConfig.timers.respawnMs
+        local respawnAt = os.time() + math.floor(respawnMs / 1000)
+        local key       = buildRayfireKey(st.cfg)
+
+        st.respawnAt = respawnAt
+
+        oxmysql:query(
+            'INSERT INTO lumberjack_rayfire (rkey, respawn_time) VALUES (?, ?) ' ..
+            'ON DUPLICATE KEY UPDATE respawn_time = VALUES(respawn_time)',
+            { key, respawnAt }, function()
+                SetTimeout(respawnMs, function()
+                    local s = rayfireState[idx]
+                    if not s then return end
+                    s.available = true
+                    s.respawnAt = 0
+                    oxmysql:update('UPDATE lumberjack_rayfire SET respawn_time = ? WHERE rkey = ?',
+                        { 0, key })
+                    local rc = s.cfg.zoneCoords or s.cfg.coords
+                    broadcastNearby(rc, sharedConfig.radius.stream,
+                        'tk_lumberjack:client:rayfireRespawn', idx)
+                end)
+                st.lock = false
+            end)
+    end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- Processing
+-- ---------------------------------------------------------------------------
+---@param src integer
+---@param fromItem string
+---@param toItem string
+---@param successKey string
 local function processItem(src, fromItem, toItem, successKey)
     local Player = RSGCore.Functions.GetPlayer(src)
     if not Player then return end
