@@ -3,44 +3,38 @@ local clientConfig = require 'config.client'
 
 local RSGCore = exports['rsg-core']:GetCoreObject()
 
--- Dynamic (DB-backed) trees ---------------------------------------------------
 local treeObjects   = {}
 local treeBlips     = {}
 local treeCoordsMap = {}
 local treeCount     = 0
 
--- RayFire (static map-object) trees -------------------------------------------
 ---@class RayfireRuntime
----@field cfg table              entry from sharedConfig.rayfire.trees
+---@field cfg table
 ---@field blip number|nil
----@field zoneId number|nil      ox_target sphere zone id
----@field available boolean      mirrored from server state
----@field falling boolean        local lock while animation plays
+---@field zoneIds table|nil
+---@field available boolean
+---@field falling boolean
 local rayfireRuntime = {}
 
-local CHECK_DIST_SQ    = sharedConfig.radius.request       * sharedConfig.radius.request
-local BLIP_RAD_SQ      = sharedConfig.radius.blip          * sharedConfig.radius.blip
-local RAYFIRE_SCAN_SQ  = sharedConfig.radius.rayfireScan   * sharedConfig.radius.rayfireScan
+local CHECK_DIST_SQ    = sharedConfig.radius.request * sharedConfig.radius.request
+local BLIP_RAD_SQ      = sharedConfig.radius.blip * sharedConfig.radius.blip
 local RAYFIRE_SEARCH_R = sharedConfig.radius.rayfireSearch
 
 local chopTree
 local chopRayfire
 
----@param ... any
 local function dprint(...)
     if sharedConfig.debug then print('[tk_lumberjack]', ...) end
 end
 
--- ---------------------------------------------------------------------------
--- Dynamic tree handling
--- ---------------------------------------------------------------------------
+-- Dynamic Trees ---------------------------------------------------------------
+
 local chopOptions = {
     {
-        icon       = 'axe',
-        label      = locale('chop_label'),
-        distance   = 2.5,
-        drawSprite = false,
-        onSelect   = function(data)
+        icon     = 'axe',
+        label    = locale('chop_label'),
+        distance = 2.5,
+        onSelect = function(data)
             for id, ent in pairs(treeObjects) do
                 if ent == data.entity then
                     chopTree(id, ent)
@@ -51,8 +45,6 @@ local chopOptions = {
     },
 }
 
----@param treeId number
----@param coords vector3
 local function SpawnTree(treeId, coords)
     if treeObjects[treeId] and DoesEntityExist(treeObjects[treeId]) then return end
 
@@ -70,19 +62,15 @@ local function SpawnTree(treeId, coords)
     exports.ox_target:addLocalEntity(obj, chopOptions)
 end
 
----@param treeId number
 local function RemoveTree(treeId)
     local ent = treeObjects[treeId]
     if ent then
         exports.ox_target:removeLocalEntity(ent)
-        if DoesEntityExist(ent) then
-            DeleteObject(ent)
-        end
+        if DoesEntityExist(ent) then DeleteObject(ent) end
         treeObjects[treeId]   = nil
         treeCoordsMap[treeId] = nil
         treeCount             = treeCount - 1
     end
-
     local blip = treeBlips[treeId]
     if blip then
         RemoveBlip(blip)
@@ -174,8 +162,6 @@ CreateThread(function()
     end
 end)
 
----@param treeId number
----@param entity number
 chopTree = function(treeId, entity)
     local hasAxe = lib.callback.await('tk_lumberjack:server:checkAxe', false)
     if not hasAxe then
@@ -194,13 +180,8 @@ chopTree = function(treeId, entity)
 
     local axe = CreateObject(clientConfig.models.axe, GetEntityCoords(ped), true, true, true)
     SetModelAsNoLongerNeeded(clientConfig.models.axe)
-    AttachEntityToEntity(
-        axe, ped,
-        GetEntityBoneIndexByName(ped, 'SKEL_R_Finger12'),
-        0.200, 0.0, 0.5010,
-        1.024, -160.0, -70.0,
-        true, true, false, true, 1, true
-    )
+    AttachEntityToEntity(axe, ped, GetEntityBoneIndexByName(ped, 'SKEL_R_Finger12'),
+        0.200, 0.0, 0.5010, 1.024, -160.0, -70.0, true, true, false, true, 1, true)
 
     TaskPlayAnim(ped, anim.dict, anim.clip, 8.0, -8.0, -1, 1, 0, false, false, false)
 
@@ -214,40 +195,32 @@ chopTree = function(treeId, entity)
 
     ClearPedTasks(ped)
     if DoesEntityExist(axe) then DeleteObject(axe) end
-
     TriggerServerEvent('tk_lumberjack:server:confirmChop', treeId)
 end
 
--- ---------------------------------------------------------------------------
--- RayFire (static) tree handling
--- ---------------------------------------------------------------------------
----@param idx integer index into sharedConfig.rayfire.trees
----@return number|nil handle
+-- RayFire Trees ---------------------------------------------------------------
+
 local function tryGetRayfireHandle(idx)
     local rt = rayfireRuntime[idx]
     if not rt then return nil end
-    local r = rt.cfg.radius or RAYFIRE_SEARCH_R
-    -- Use player position as search center
     local ped = cache.ped
     if not ped then return nil end
     local pc = GetEntityCoords(ped)
+    local r = rt.cfg.radius or RAYFIRE_SEARCH_R
     local handle = Citizen.InvokeNative(0xB48FCED898292E52, pc, r, rt.cfg.name)
     if handle and handle ~= 0 and Citizen.InvokeNative(0x52AF537A0C5B8AAD, handle) then
-        local oc = GetEntityCoords(handle)
-        dprint(('rayfire[%d] found handle=%d name=%s objCoords=%.2f,%.2f,%.2f'):format(
-            idx, handle, rt.cfg.name, oc.x, oc.y, oc.z))
+        dprint(('rayfire[%d] found handle=%d name=%s'):format(idx, handle, rt.cfg.name))
         return handle
     end
-    dprint(('rayfire[%d] NOT found name=%s'):format(idx, rt.cfg.name))
     return nil
 end
 
----@param idx integer
 local function ensureRayfireBlip(idx)
     local rt = rayfireRuntime[idx]
     if rt.blip or not rt.available then return end
     local b = clientConfig.blip
-    local c = rt.cfg.coords
+    local zc = rt.cfg.zoneCoords
+    local c = (zc and zc[1]) or rt.cfg.coords
     local blip = N_0x554d9d53f696d002(b.type, c.x, c.y, c.z)
     SetBlipSprite(blip, b.sprite, 1)
     SetBlipScale(blip, b.scale)
@@ -255,7 +228,6 @@ local function ensureRayfireBlip(idx)
     rt.blip = blip
 end
 
----@param idx integer
 local function clearRayfireBlip(idx)
     local rt = rayfireRuntime[idx]
     if rt and rt.blip then
@@ -264,43 +236,41 @@ local function clearRayfireBlip(idx)
     end
 end
 
----@param idx integer
 local function ensureRayfireZone(idx)
     local rt = rayfireRuntime[idx]
-    if rt.zoneId or not rt.available then return end
+    if rt.zoneIds or not rt.available then return end
+    if not tryGetRayfireHandle(idx) then return end
 
-    local handle = tryGetRayfireHandle(idx)
-    if not handle then return end
-
-    -- Use zoneCoords from config (actual tree position), fallback to coords (search center)
-    local c = rt.cfg.zoneCoords or rt.cfg.coords
-    dprint(('rayfire[%d] creating zone at %.2f,%.2f,%.2f'):format(idx, c.x, c.y, c.z))
-
-    rt.zoneId = exports.ox_target:addSphereZone({
-        coords     = c,
-        radius     = 5.0,
-        drawSprite = true,
-        options    = {
-            {
-                icon     = 'axe',
-                label    = locale('chop_label'),
-                distance = 5.0,
-                onSelect = function() chopRayfire(idx) end,
+    local zones = rt.cfg.zoneCoords or { rt.cfg.coords }
+    rt.zoneIds = {}
+    for i, c in ipairs(zones) do
+        dprint(('rayfire[%d] creating zone %d at %.2f,%.2f,%.2f'):format(idx, i, c.x, c.y, c.z))
+        rt.zoneIds[i] = exports.ox_target:addSphereZone({
+            coords     = c,
+            radius     = 5.0,
+            drawSprite = true,
+            options    = {
+                {
+                    icon     = 'axe',
+                    label    = locale('chop_label'),
+                    distance = 5.0,
+                    onSelect = function() chopRayfire(idx) end,
+                },
             },
-        },
-    })
-end
-
----@param idx integer
-local function clearRayfireZone(idx)
-    local rt = rayfireRuntime[idx]
-    if rt and rt.zoneId then
-        exports.ox_target:removeZone(rt.zoneId)
-        rt.zoneId = nil
+        })
     end
 end
 
----@param idx integer
+local function clearRayfireZone(idx)
+    local rt = rayfireRuntime[idx]
+    if rt and rt.zoneIds then
+        for _, zid in ipairs(rt.zoneIds) do
+            exports.ox_target:removeZone(zid)
+        end
+        rt.zoneIds = nil
+    end
+end
+
 local function playRayfireFall(idx)
     local rt = rayfireRuntime[idx]
     if not rt or rt.falling then return end
@@ -311,7 +281,6 @@ local function playRayfireFall(idx)
             rt.falling = false
             return
         end
-        -- State 4 resets, then state 6 triggers the RayFire fall sequence
         Citizen.InvokeNative(0x5C29F698D404C5E1, handle, 4)
         Wait(500)
         Citizen.InvokeNative(0x5C29F698D404C5E1, handle, 6)
@@ -320,19 +289,15 @@ local function playRayfireFall(idx)
     end)
 end
 
----@param idx integer
 local function resetRayfire(idx)
     local rt = rayfireRuntime[idx]
     if not rt then return end
     local handle = tryGetRayfireHandle(idx)
     if handle then
-        -- State 4 = reset to default
         Citizen.InvokeNative(0x5C29F698D404C5E1, handle, 4)
     end
 end
 
----@param idx integer
----@param available boolean
 local function setRayfireAvailability(idx, available)
     local rt = rayfireRuntime[idx]
     if not rt then return end
@@ -345,7 +310,6 @@ local function setRayfireAvailability(idx, available)
     end
 end
 
----@param idx integer
 chopRayfire = function(idx)
     local rt = rayfireRuntime[idx]
     if not rt or not rt.available or rt.falling then
@@ -362,19 +326,15 @@ chopRayfire = function(idx)
     lib.requestModel(clientConfig.models.axe)
 
     local ped = cache.ped
-    local c = rt.cfg.coords
+    local zc = rt.cfg.zoneCoords
+    local c = (zc and zc[1]) or rt.cfg.coords
     SetEntityHeading(ped, GetHeadingFromVector_2d(c.x - GetEntityCoords(ped).x, c.y - GetEntityCoords(ped).y))
     Wait(400)
 
     local axe = CreateObject(clientConfig.models.axe, GetEntityCoords(ped), true, true, true)
     SetModelAsNoLongerNeeded(clientConfig.models.axe)
-    AttachEntityToEntity(
-        axe, ped,
-        GetEntityBoneIndexByName(ped, 'SKEL_R_Finger12'),
-        0.200, 0.0, 0.5010,
-        1.024, -160.0, -70.0,
-        true, true, false, true, 1, true
-    )
+    AttachEntityToEntity(axe, ped, GetEntityBoneIndexByName(ped, 'SKEL_R_Finger12'),
+        0.200, 0.0, 0.5010, 1.024, -160.0, -70.0, true, true, false, true, 1, true)
 
     TaskPlayAnim(ped, anim.dict, anim.clip, 8.0, -8.0, -1, 1, 0, false, false, false)
 
@@ -388,7 +348,6 @@ chopRayfire = function(idx)
 
     ClearPedTasks(ped)
     if DoesEntityExist(axe) then DeleteObject(axe) end
-
     TriggerServerEvent('tk_lumberjack:server:confirmRayfireChop', idx)
 end
 
@@ -414,15 +373,13 @@ CreateThread(function()
         rayfireRuntime[i] = {
             cfg       = entries[i],
             blip      = nil,
-            zoneId    = nil,
+            zoneIds   = nil,
             available = true,
             falling   = false,
         }
     end
-
     if next(rayfireRuntime) == nil then return end
 
-    -- request initial state once player ped exists
     while not cache.ped do Wait(500) end
     local states = lib.callback.await('tk_lumberjack:server:getRayfireStates', false)
     if type(states) == 'table' then
@@ -433,8 +390,7 @@ CreateThread(function()
 
     while true do
         Wait(clientConfig.rayfireScanMs or 1000)
-        local ped = cache.ped
-        if ped then
+        if cache.ped then
             for idx, rt in pairs(rayfireRuntime) do
                 if rt.available then
                     if tryGetRayfireHandle(idx) then
@@ -450,10 +406,8 @@ CreateThread(function()
     end
 end)
 
--- ---------------------------------------------------------------------------
--- Processing
--- ---------------------------------------------------------------------------
----@param eventName string
+-- Processing ------------------------------------------------------------------
+
 local function showProcessMenu(eventName)
     local anim = clientConfig.processAnim
     lib.requestAnimDict(anim.dict)
@@ -504,14 +458,12 @@ end)
 
 AddEventHandler('onResourceStart', function(resource)
     if resource ~= GetCurrentResourceName() then return end
-
     exports.ox_target:addBoxZone({
-        coords     = sharedConfig.locations.processLog,
-        size       = vec3(2.5, 2.5, 2.0),
-        rotation   = 0,
-        drawSprite = false,
-        distance   = 2.5,
-        options    = {
+        coords   = sharedConfig.locations.processLog,
+        size     = vec3(2.5, 2.5, 2.0),
+        rotation = 0,
+        distance = 2.5,
+        options  = {
             {
                 icon     = 'hammer',
                 label    = locale('process_open'),
@@ -529,12 +481,12 @@ AddEventHandler('onResourceStop', function(resource)
     for _, blip in pairs(treeBlips) do
         if blip then RemoveBlip(blip) end
     end
-    for idx, _ in pairs(rayfireRuntime) do
+    for idx in pairs(rayfireRuntime) do
         clearRayfireBlip(idx)
         clearRayfireZone(idx)
     end
     treeObjects, treeBlips, treeCoordsMap = {}, {}, {}
-    treeCount    = 0
+    treeCount      = 0
     rayfireRuntime = {}
 end)
 
@@ -543,14 +495,12 @@ RegisterCommand('lumberjack_debug', function()
     for _, blip in pairs(treeBlips) do
         if DoesBlipExist(blip) then activeBlips = activeBlips + 1 end
     end
-    local rayfireCount, rayfireBlips = 0, 0
+    local rc, rb = 0, 0
     for _, rt in pairs(rayfireRuntime) do
-        rayfireCount = rayfireCount + 1
-        if rt.blip and DoesBlipExist(rt.blip) then rayfireBlips = rayfireBlips + 1 end
+        rc = rc + 1
+        if rt.blip and DoesBlipExist(rt.blip) then rb = rb + 1 end
     end
-    print(('[tk_lumberjack] trees=%d blips=%d rayfire=%d rayfireBlips=%d requestRadius=%.1f blipRadius=%.1f'):format(
-        treeCount, activeBlips, rayfireCount, rayfireBlips,
-        sharedConfig.radius.request, sharedConfig.radius.blip))
+    print(('[tk_lumberjack] trees=%d blips=%d rayfire=%d rayfireBlips=%d'):format(treeCount, activeBlips, rc, rb))
 end, false)
 
 RegisterCommand('rayfire_mypos', function()
