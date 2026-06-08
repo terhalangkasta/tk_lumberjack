@@ -110,6 +110,21 @@ local function rayfireZoneCoords(st)
     return st.cfg.coords
 end
 
+-- Schedules a rayfire entry to become available again after delayMs, clearing
+-- its DB respawn marker and notifying nearby clients. Shared by DB load
+-- (resuming a pending respawn) and the chop flow (starting a new one).
+local function scheduleRayfireRespawn(idx, key, delayMs)
+    SetTimeout(delayMs, function()
+        local s = rayfireState[idx]
+        if not s then return end
+        s.available = true
+        s.respawnAt = 0
+        oxmysql:update('UPDATE lumberjack_rayfire SET respawn_time = ? WHERE rkey = ?', { 0, key })
+        broadcastNearby(rayfireZoneCoords(s), sharedConfig.radius.stream,
+            'tk_lumberjack:client:rayfireRespawn', idx)
+    end)
+end
+
 local function loadRayfireFromDB()
     local entries = sharedConfig.rayfire and sharedConfig.rayfire.trees or {}
     rayfireState = {}
@@ -130,15 +145,7 @@ local function loadRayfireFromDB()
             st.respawnAt = rt
             if rt ~= 0 and rt > now then
                 st.available = false
-                SetTimeout((rt - now) * 1000, function()
-                    local s = rayfireState[idx]
-                    if not s then return end
-                    s.available = true
-                    s.respawnAt = 0
-                    oxmysql:update('UPDATE lumberjack_rayfire SET respawn_time = ? WHERE rkey = ?', { 0, key })
-                    broadcastNearby(rayfireZoneCoords(s), sharedConfig.radius.stream,
-                        'tk_lumberjack:client:rayfireRespawn', idx)
-                end)
+                scheduleRayfireRespawn(idx, key, (rt - now) * 1000)
             else
                 st.available = true
                 st.respawnAt = 0
@@ -234,7 +241,12 @@ end)
 
 -- Rewards ---------------------------------------------------------------------
 
-local function grantChopRewards(Player, src)
+-- Re-fetches the player by src at grant time: the caller schedules this behind
+-- a timeout, by which point the original Player handle may be stale (dropped).
+local function grantChopRewards(src)
+    local Player = RSGCore.Functions.GetPlayer(src)
+    if not Player then return end
+
     local logItem  = sharedConfig.items.logItem
     local twigItem = sharedConfig.items.twigItem
     local logR     = sharedConfig.rewards.log
@@ -248,6 +260,32 @@ local function grantChopRewards(Player, src)
         Player.Functions.AddItem(twigItem, math.random(twigR.min, twigR.max))
         TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[twigItem], 'add')
     end
+end
+
+-- Server-side anti-cheat distance check shared by both chop flows.
+local function isWithin(src, coords, maxDist)
+    local ped = GetPlayerPed(src)
+    if ped == 0 then return true end
+    local pc = GetEntityCoords(ped)
+    local dx, dy, dz = coords.x - pc.x, coords.y - pc.y, coords.z - pc.z
+    return (dx * dx + dy * dy + dz * dz) <= (maxDist * maxDist)
+end
+
+-- Shared tool + distance validation. On failure it releases the per-target lock
+-- via `release` and notifies the player, returning false. tooFarKey lets each
+-- flow surface its own "too far" locale string.
+local function passesChopGuards(src, Player, coords, tooFarKey, release)
+    if not Player.Functions.GetItemByName(sharedConfig.items.requiredTool) then
+        release()
+        notify(src, 'no_tool', 'error')
+        return false
+    end
+    if not isWithin(src, coords, sharedConfig.radius.chopAntiCheat) then
+        release()
+        notify(src, tooFarKey, 'error')
+        return false
+    end
+    return true
 end
 
 -- Dynamic Tree Chop -----------------------------------------------------------
@@ -264,27 +302,14 @@ RegisterNetEvent('tk_lumberjack:server:confirmChop', function(treeId)
     if choppingLocks[treeId] then return end
     choppingLocks[treeId] = true
 
-    if not Player.Functions.GetItemByName(sharedConfig.items.requiredTool) then
-        choppingLocks[treeId] = nil
-        return notify(src, 'no_tool', 'error')
-    end
-
-    local ped = GetPlayerPed(src)
-    if ped ~= 0 then
-        local pc = GetEntityCoords(ped)
-        local dx, dy, dz = t.x - pc.x, t.y - pc.y, t.z - pc.z
-        local maxDist = sharedConfig.radius.chopAntiCheat
-        if (dx * dx + dy * dy + dz * dz) > (maxDist * maxDist) then
-            choppingLocks[treeId] = nil
-            return notify(src, 'tree_too_far', 'error')
-        end
-    end
-
     local treeCoords = vec3(t.x, t.y, t.z)
+    local function release() choppingLocks[treeId] = nil end
+    if not passesChopGuards(src, Player, treeCoords, 'tree_too_far', release) then return end
+
     broadcastNearby(treeCoords, sharedConfig.radius.chop, 'tk_lumberjack:client:toppleTree', treeId)
 
     SetTimeout(2500, function()
-        grantChopRewards(Player, src)
+        grantChopRewards(src)
         local respawnMs = sharedConfig.timers.respawnMs
         local respawnAt = os.time() + math.floor(respawnMs / 1000)
         if trees[treeId] then trees[treeId].respawn_time = respawnAt end
@@ -309,28 +334,15 @@ RegisterNetEvent('tk_lumberjack:server:confirmRayfireChop', function(idx)
     end
     st.lock = true
 
-    if not Player.Functions.GetItemByName(sharedConfig.items.requiredTool) then
-        st.lock = false
-        return notify(src, 'no_tool', 'error')
-    end
-
     local zoneC = rayfireZoneCoords(st)
-    local ped = GetPlayerPed(src)
-    if ped ~= 0 then
-        local pc = GetEntityCoords(ped)
-        local dx, dy, dz = zoneC.x - pc.x, zoneC.y - pc.y, zoneC.z - pc.z
-        local maxDist = sharedConfig.radius.chopAntiCheat
-        if (dx * dx + dy * dy + dz * dz) > (maxDist * maxDist) then
-            st.lock = false
-            return notify(src, 'rayfire_too_far', 'error')
-        end
-    end
+    local function release() st.lock = false end
+    if not passesChopGuards(src, Player, zoneC, 'rayfire_too_far', release) then return end
 
     st.available = false
     broadcastNearby(zoneC, sharedConfig.radius.chop, 'tk_lumberjack:client:rayfireFall', idx)
 
     SetTimeout(2500, function()
-        grantChopRewards(Player, src)
+        grantChopRewards(src)
         local respawnMs = st.cfg.respawn or sharedConfig.timers.respawnMs
         local respawnAt = os.time() + math.floor(respawnMs / 1000)
         local key       = buildRayfireKey(st.cfg)
@@ -339,15 +351,7 @@ RegisterNetEvent('tk_lumberjack:server:confirmRayfireChop', function(idx)
         oxmysql:query(
             'INSERT INTO lumberjack_rayfire (rkey, respawn_time) VALUES (?, ?) ON DUPLICATE KEY UPDATE respawn_time = VALUES(respawn_time)',
             { key, respawnAt }, function()
-                SetTimeout(respawnMs, function()
-                    local s = rayfireState[idx]
-                    if not s then return end
-                    s.available = true
-                    s.respawnAt = 0
-                    oxmysql:update('UPDATE lumberjack_rayfire SET respawn_time = ? WHERE rkey = ?', { 0, key })
-                    broadcastNearby(rayfireZoneCoords(s), sharedConfig.radius.stream,
-                        'tk_lumberjack:client:rayfireRespawn', idx)
-                end)
+                scheduleRayfireRespawn(idx, key, respawnMs)
                 st.lock = false
             end)
     end)

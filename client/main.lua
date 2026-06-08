@@ -29,21 +29,20 @@ end
 
 -- Dynamic Trees ---------------------------------------------------------------
 
-local chopOptions = {
-    {
-        icon     = 'axe',
-        label    = locale('chop_label'),
-        distance = 2.5,
-        onSelect = function(data)
-            for id, ent in pairs(treeObjects) do
-                if ent == data.entity then
-                    chopTree(id, ent)
-                    return
-                end
-            end
-        end,
-    },
-}
+-- Build a fresh option set that closes over treeId so ox_target invokes the
+-- chop directly instead of scanning every tracked entity on each interaction.
+local function buildChopOptions(treeId)
+    return {
+        {
+            icon     = 'axe',
+            label    = locale('chop_label'),
+            distance = 2.5,
+            onSelect = function()
+                chopTree(treeId, treeObjects[treeId])
+            end,
+        },
+    }
+end
 
 local function SpawnTree(treeId, coords)
     if treeObjects[treeId] and DoesEntityExist(treeObjects[treeId]) then return end
@@ -59,7 +58,7 @@ local function SpawnTree(treeId, coords)
     treeCoordsMap[treeId] = vector3(coords.x, coords.y, coords.z)
     treeCount             = treeCount + 1
 
-    exports.ox_target:addLocalEntity(obj, chopOptions)
+    exports.ox_target:addLocalEntity(obj, buildChopOptions(treeId))
 end
 
 local function RemoveTree(treeId)
@@ -162,7 +161,10 @@ CreateThread(function()
     end
 end)
 
-chopTree = function(treeId, entity)
+-- Shared chop sequence used by both dynamic and RayFire trees. The only
+-- per-mode differences are how the ped is oriented before chopping (faceFn)
+-- and which server event is fired afterwards (onComplete).
+local function performChop(faceFn, onComplete)
     local hasAxe = lib.callback.await('tk_lumberjack:server:checkAxe', false)
     if not hasAxe then
         return lib.notify({ title = locale('title'), description = locale('no_axe'), type = 'error' })
@@ -173,10 +175,7 @@ chopTree = function(treeId, entity)
     lib.requestModel(clientConfig.models.axe)
 
     local ped = cache.ped
-    if entity and DoesEntityExist(entity) then
-        TaskTurnPedToFaceEntity(ped, entity, -1)
-        Wait(800)
-    end
+    if faceFn then faceFn(ped) end
 
     local axe = CreateObject(clientConfig.models.axe, GetEntityCoords(ped), true, true, true)
     SetModelAsNoLongerNeeded(clientConfig.models.axe)
@@ -195,10 +194,32 @@ chopTree = function(treeId, entity)
 
     ClearPedTasks(ped)
     if DoesEntityExist(axe) then DeleteObject(axe) end
-    TriggerServerEvent('tk_lumberjack:server:confirmChop', treeId)
+    onComplete()
+end
+
+chopTree = function(treeId, entity)
+    performChop(
+        function(ped)
+            if entity and DoesEntityExist(entity) then
+                TaskTurnPedToFaceEntity(ped, entity, -1)
+                Wait(800)
+            end
+        end,
+        function()
+            TriggerServerEvent('tk_lumberjack:server:confirmChop', treeId)
+        end
+    )
 end
 
 -- RayFire Trees ---------------------------------------------------------------
+
+-- Primary interaction coord for a runtime entry: first zone coord, else the
+-- search-center coords. Mirrors the server-side resolver of the same name.
+local function rayfireZoneCoords(rt)
+    local zc = rt.cfg.zoneCoords
+    if zc and zc[1] then return zc[1] end
+    return rt.cfg.coords
+end
 
 local function tryGetRayfireHandle(idx)
     local rt = rayfireRuntime[idx]
@@ -219,8 +240,7 @@ local function ensureRayfireBlip(idx)
     local rt = rayfireRuntime[idx]
     if rt.blip or not rt.available then return end
     local b = clientConfig.blip
-    local zc = rt.cfg.zoneCoords
-    local c = (zc and zc[1]) or rt.cfg.coords
+    local c = rayfireZoneCoords(rt)
     local blip = N_0x554d9d53f696d002(b.type, c.x, c.y, c.z)
     SetBlipSprite(blip, b.sprite, 1)
     SetBlipScale(blip, b.scale)
@@ -316,46 +336,28 @@ chopRayfire = function(idx)
         return lib.notify({ title = locale('title'), description = locale('rayfire_unavailable'), type = 'error' })
     end
 
-    local hasAxe = lib.callback.await('tk_lumberjack:server:checkAxe', false)
-    if not hasAxe then
-        return lib.notify({ title = locale('title'), description = locale('no_axe'), type = 'error' })
-    end
-
-    local anim = clientConfig.chopAnim
-    lib.requestAnimDict(anim.dict)
-    lib.requestModel(clientConfig.models.axe)
-
-    local ped = cache.ped
-    local zc = rt.cfg.zoneCoords
-    local c = (zc and zc[1]) or rt.cfg.coords
-    SetEntityHeading(ped, GetHeadingFromVector_2d(c.x - GetEntityCoords(ped).x, c.y - GetEntityCoords(ped).y))
-    Wait(400)
-
-    local axe = CreateObject(clientConfig.models.axe, GetEntityCoords(ped), true, true, true)
-    SetModelAsNoLongerNeeded(clientConfig.models.axe)
-    AttachEntityToEntity(axe, ped, GetEntityBoneIndexByName(ped, 'SKEL_R_Finger12'),
-        0.200, 0.0, 0.5010, 1.024, -160.0, -70.0, true, true, false, true, 1, true)
-
-    TaskPlayAnim(ped, anim.dict, anim.clip, 8.0, -8.0, -1, 1, 0, false, false, false)
-
-    lib.progressCircle({
-        duration  = sharedConfig.timers.chopDurationMs,
-        label     = locale('progress_chop'),
-        position  = 'bottom',
-        canCancel = false,
-        disable   = { car = true, move = true, combat = true },
-    })
-
-    ClearPedTasks(ped)
-    if DoesEntityExist(axe) then DeleteObject(axe) end
-    TriggerServerEvent('tk_lumberjack:server:confirmRayfireChop', idx)
+    local c = rayfireZoneCoords(rt)
+    performChop(
+        function(ped)
+            local pc = GetEntityCoords(ped)
+            SetEntityHeading(ped, GetHeadingFromVector_2d(c.x - pc.x, c.y - pc.y))
+            Wait(400)
+        end,
+        function()
+            TriggerServerEvent('tk_lumberjack:server:confirmRayfireChop', idx)
+        end
+    )
 end
 
-RegisterNetEvent('tk_lumberjack:client:syncRayfire', function(states)
+local function applyRayfireStates(states)
     if type(states) ~= 'table' then return end
     for idx, available in pairs(states) do
         setRayfireAvailability(idx, available)
     end
+end
+
+RegisterNetEvent('tk_lumberjack:client:syncRayfire', function(states)
+    applyRayfireStates(states)
 end)
 
 RegisterNetEvent('tk_lumberjack:client:rayfireFall', function(idx)
@@ -381,12 +383,7 @@ CreateThread(function()
     if next(rayfireRuntime) == nil then return end
 
     while not cache.ped do Wait(500) end
-    local states = lib.callback.await('tk_lumberjack:server:getRayfireStates', false)
-    if type(states) == 'table' then
-        for idx, available in pairs(states) do
-            setRayfireAvailability(idx, available)
-        end
-    end
+    applyRayfireStates(lib.callback.await('tk_lumberjack:server:getRayfireStates', false))
 
     while true do
         Wait(clientConfig.rayfireScanMs or 1000)
